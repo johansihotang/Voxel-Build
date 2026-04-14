@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Voxel Builder AR - Hand Tracking</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Three.js -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <!-- MediaPipe Hands -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #f0f0f0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        #canvas-container { width: 100vw; height: 100vh; position: absolute; top: 0; left: 0; z-index: 1; }
+        
+        /* UI Overlay */
+        #ui-layer { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 10; pointer-events: none; }
+        
+        /* Video Feed (Picture in Picture untuk feedback) */
+        .video-pip {
+            position: absolute; bottom: 20px; right: 20px; width: 240px; height: 180px;
+            border-radius: 12px; border: 3px solid white; box-shadow: 0 4px 15px rgba(0,0,0,0.3);
+            background: #000; overflow: hidden; transform: scaleX(-1); /* Mirror view */
+        }
+        .video-pip video, .video-pip canvas { width: 100%; height: 100%; position: absolute; top: 0; left: 0; object-fit: cover; }
+        
+        /* Loading Screen */
+        #loading {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(15, 23, 42, 0.95); display: flex; flex-direction: column;
+            justify-content: center; align-items: center; z-index: 50; color: white; pointer-events: all;
+        }
+        .spinner {
+            border: 4px solid rgba(255,255,255,0.1); border-left-color: #3b82f6;
+            border-radius: 50%; width: 50px; height: 50px; animation: spin 1s linear infinite; margin-bottom: 20px;
+        }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    </style>
+</head>
+<body>
+
+    <!-- Loading Screen -->
+    <div id="loading">
+        <div class="spinner"></div>
+        <h1 class="text-2xl font-bold mb-2">Memuat AI Model...</h1>
+        <p class="text-gray-400 text-center max-w-md">Mohon tunggu sebentar dan berikan izin akses kamera untuk menggunakan pelacakan tangan.</p>
+    </div>
+
+    <!-- UI Overlay -->
+    <div id="ui-layer" class="p-6 flex flex-col justify-between">
+        <div class="flex justify-between items-start">
+            <div class="bg-black/60 backdrop-blur-md text-white p-4 rounded-xl shadow-lg w-80 pointer-events-auto">
+                <h2 class="text-lg font-bold mb-2 text-blue-400">🎮 Kontrol Gestur</h2>
+                <ul class="text-sm space-y-2">
+                    <li><span class="font-bold text-green-400">Tangan Kanan:</span><br>• Telunjuk: Gerakkan kursor<br>• Jepit Telunjuk: Pasang Blok<br>• Jepit Jari Tengah: Hapus Blok</li>
+                    <li><span class="font-bold text-yellow-400">Tangan Kiri:</span><br>• Gerakkan: Putar Kamera<br>• Jepit: Zoom In/Out</li>
+                    <li><span class="font-bold text-purple-400">Dua Tangan:</span><br>• Dekatkan (Tepuk): Ganti Warna</li>
+                </ul>
+            </div>
+            
+            <div class="bg-black/60 backdrop-blur-md text-white p-4 rounded-xl shadow-lg pointer-events-auto flex flex-col items-center">
+                <span class="text-xs font-semibold mb-2 uppercase tracking-wider text-gray-300">Warna Aktif</span>
+                <div id="color-indicator" class="w-12 h-12 rounded-full border-4 border-white shadow-inner transition-colors duration-300 bg-red-500"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- PIP Webcam Feed -->
+    <div class="video-pip z-20">
+        <video id="input_video" autoplay playsinline></video>
+        <canvas id="output_canvas"></canvas>
+    </div>
+
+    <!-- 3D Canvas -->
+    <div id="canvas-container"></div>
+
+<script>
+/**
+ * KONFIGURASI GLOBAL & STATE APLIKASI
+ */
+const state = {
+    colors: [0xff0000, 0x00ff00, 0x0000ff, 0xffff00, 0xff00ff, 0x00ffff, 0xffffff, 0x333333],
+    currentColorIndex: 0,
+    lastBuildTime: 0,
+    lastDeleteTime: 0,
+    lastColorSwapTime: 0,
+    cooldown: 500, // ms
+    
+    // Camera Orbit State
+    cameraAzimuth: Math.PI / 4,
+    cameraPolar: Math.PI / 4,
+    cameraRadius: 1000,
+    targetAzimuth: Math.PI / 4,
+    targetPolar: Math.PI / 3,
+    targetRadius: 1000,
+    
+    // Raycaster pointer
+    pointer: new THREE.Vector2(),
+    cursorActive: false
+};
+
+// Konstanta Voxel
+const VOXEL_SIZE = 50;
+
+// Elemen DOM
+const videoElement = document.getElementById('input_video');
+const canvasElement = document.getElementById('output_canvas');
+const canvasCtx = canvasElement.getContext('2d');
+const colorIndicator = document.getElementById('color-indicator');
+const loadingScreen = document.getElementById('loading');
+
+/**
+ * 1. SETUP THREE.JS LINGKUNGAN 3D
+ */
+const container = document.getElementById('canvas-container');
+const scene = new THREE.Scene();
+scene.background = new THREE.Color( 0xf0f0f0 );
+
+const camera = new THREE.PerspectiveCamera( 45, window.innerWidth / window.innerHeight, 1, 10000 );
+camera.position.set( 500, 800, 1300 );
+camera.lookAt( 0, 0, 0 );
+
+const renderer = new THREE.WebGLRenderer( { antialias: true } );
+renderer.setPixelRatio( window.devicePixelRatio );
+renderer.setSize( window.innerWidth, window.innerHeight );
+container.appendChild( renderer.domElement );
+
+// Pencahayaan
+const ambientLight = new THREE.AmbientLight( 0x606060 );
+scene.add( ambientLight );
+const directionalLight = new THREE.DirectionalLight( 0xffffff );
+directionalLight.position.set( 1, 0.75, 0.5 ).normalize();
+scene.add( directionalLight );
+
+// Grid & Base Plane
+const gridHelper = new THREE.GridHelper( 1000, 20 );
+scene.add( gridHelper );
+
+const geometry = new THREE.PlaneGeometry( 1000, 1000 );
+geometry.rotateX( - Math.PI / 2 );
+const plane = new THREE.Mesh( geometry, new THREE.MeshBasicMaterial( { visible: false } ) );
+scene.add( plane );
+
+// Array untuk menyimpan objek yang bisa ditabrak raycaster (Lantai + Voxel)
+const objects = [ plane ];
+
+// Roll-over / Ghost Block (Indikator Kursor Tangan Kanan)
+const rollOverGeo = new THREE.BoxGeometry( VOXEL_SIZE, VOXEL_SIZE, VOXEL_SIZE );
+const rollOverMaterial = new THREE.MeshBasicMaterial( { color: 0xff0000, opacity: 0.5, transparent: true } );
+const rollOverMesh = new THREE.Mesh( rollOverGeo, rollOverMaterial );
+scene.add( rollOverMesh );
+
+// Material dasar untuk Voxel baru
+const cubeGeo = new THREE.BoxGeometry( VOXEL_SIZE, VOXEL_SIZE, VOXEL_SIZE );
+function getCubeMaterial() {
+    return new THREE.MeshLambertMaterial( { color: state.colors[state.currentColorIndex] } );
+}
+
+const raycaster = new THREE.Raycaster();
+
+// Resize Handler
+window.addEventListener( 'resize', onWindowResize );
+function onWindowResize() {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize( window.innerWidth, window.innerHeight );
+}
+
+
+/**
+ * 2. LOGIKA MATEMATIKA & GESTUR
+ */
+
+// Menghitung jarak 3D antara dua titik landmark
+function getDistance(p1, p2) {
+    return Math.sqrt(Math.pow(p1.x - p2.x, 2) + Math.pow(p1.y - p2.y, 2) + Math.pow(p1.z - p2.z, 2));
+}
+
+// Fungsi Lerp untuk pergerakan kamera yang mulus
+function lerp(start, end, amt) {
+    return (1 - amt) * start + amt * end;
+}
+
+// Memperbarui UI Warna
+function updateColorUI() {
+    const hex = state.colors[state.currentColorIndex].toString(16).padStart(6, '0');
+    colorIndicator.style.backgroundColor = `#${hex}`;
+    rollOverMesh.material.color.setHex(state.colors[state.currentColorIndex]);
+}
+
+
+/**
+ * 3. SETUP MEDIAPIPE HANDS & PEMROSESAN GESTUR
+ */
+function onResults(results) {
+    // Sembunyikan loading screen saat frame pertama berhasil diproses
+    if(loadingScreen.style.display !== 'none') {
+        loadingScreen.style.display = 'none';
+    }
+
+    // Gambar ulang video ke PIP canvas
+    canvasCtx.save();
+    canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+    canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+
+    let rightHand = null;
+    let leftHand = null;
+
+    if (results.multiHandLandmarks && results.multiHandedness) {
+        for (let i = 0; i < results.multiHandLandmarks.length; i++) {
+            const landmarks = results.multiHandLandmarks[i];
+            const handedness = results.multiHandedness[i].label; // "Left" atau "Right"
+
+            // Gambar kerangka tangan untuk feedback visual
+            drawConnectors(canvasCtx, landmarks, HAND_CONNECTIONS, {color: '#00FF00', lineWidth: 2});
+            drawLandmarks(canvasCtx, landmarks, {color: '#FF0000', lineWidth: 1, radius: 2});
+
+            // Catatan: Karena kita mirroring gambar secara visual, deteksi 'Left' MediaPipe
+            // biasanya merupakan Tangan Kanan pengguna, dan sebaliknya.
+            if (handedness === 'Left') rightHand = landmarks; // Mapping terbalik karena kamera un-mirrored
+            else if (handedness === 'Right') leftHand = landmarks;
+        }
+    }
+    canvasCtx.restore();
+
+    const now = Date.now();
+
+    // --- LOGIKA DUAL HANDS (GANTI WARNA) ---
+    if (rightHand && leftHand) {
+        const rightIndex = rightHand[8];
+        const leftIndex = leftHand[8];
+        const handsDist = getDistance(rightIndex, leftIndex);
+
+        // Jika jarak kedua telunjuk sangat dekat (Tepuk/Clap)
+        if (handsDist < 0.1 && now - state.lastColorSwapTime > 1000) {
+            state.currentColorIndex = (state.currentColorIndex + 1) % state.colors.length;
+            updateColorUI();
+            state.lastColorSwapTime = now;
+            
+            // Efek visual sementara pada UI
+            colorIndicator.style.transform = 'scale(1.3)';
+            setTimeout(() => colorIndicator.style.transform = 'scale(1)', 200);
+        }
+    }
+
+    // --- LOGIKA TANGAN KIRI (NAVIGATOR / KAMERA) ---
+    if (leftHand) {
+        // Rotasi Kamera (Berdasarkan posisi pergelangan tangan kiri)
+        const wrist = leftHand[0];
+        // Petakan X (0 ke 1) ke sudut Azimuth (-Math.PI ke Math.PI)
+        state.targetAzimuth = lerp(-Math.PI, Math.PI, wrist.x);
+        // Petakan Y (0 ke 1) ke sudut Polar (Mencegah kamera tembus lantai)
+        state.targetPolar = lerp(0.1, Math.PI / 2 - 0.1, wrist.y);
+
+        // Zoom Kamera (Berdasarkan jarak jepit Telunjuk dan Jempol Tangan Kiri)
+        const thumbTip = leftHand[4];
+        const indexTip = leftHand[8];
+        const pinchDist = getDistance(thumbTip, indexTip);
+        
+        // Petakan jarak jepit (0.02 - 0.2) ke radius kamera (500 - 2000)
+        let zoomFactor = (pinchDist - 0.02) / 0.18; 
+        zoomFactor = Math.max(0, Math.min(1, zoomFactor)); // Clamp 0-1
+        // Semakin dekat jari, semakin zoom out. Semakin lebar jari, zoom in.
+        state.targetRadius = lerp(1800, 400, zoomFactor); 
+    }
+
+    // --- LOGIKA TANGAN KANAN (BUILDER / KURSOR) ---
+    if (rightHand) {
+        state.cursorActive = true;
+        const thumbTip = rightHand[4];
+        const indexTip = rightHand[8];
+        const middleTip = rightHand[12];
+
+        // 1. Kursor (Mapping Ujung Telunjuk ke Koordinat Layar)
+        // Karena kamera di mirror secara visual via CSS, kita harus invert X-nya
+        state.pointer.x = - (indexTip.x * 2 - 1); 
+        state.pointer.y = - (indexTip.y * 2 - 1);
+
+        // 2. Deteksi Aksi Build & Delete
+        const buildPinchDist = getDistance(thumbTip, indexTip);
+        const deletePinchDist = getDistance(thumbTip, middleTip);
+
+        // Deteksi Build (Jepit Telunjuk)
+        if (buildPinchDist < 0.05 && now - state.lastBuildTime > state.cooldown) {
+            executeBuild();
+            state.lastBuildTime = now;
+        } 
+        // Deteksi Delete (Jepit Jari Tengah)
+        else if (deletePinchDist < 0.05 && now - state.lastDeleteTime > state.cooldown) {
+            executeDelete();
+            state.lastDeleteTime = now;
+        }
+
+    } else {
+        state.cursorActive = false;
+        // Sembunyikan ghost block jika tangan kanan tidak terdeteksi
+        rollOverMesh.position.set(0, -1000, 0); 
+    }
+}
+
+/**
+ * 4. EKSEKUSI BUILD & DELETE (RAYCASTING TIGA.JS)
+ */
+function updateRaycaster() {
+    if (!state.cursorActive) return;
+
+    raycaster.setFromCamera( state.pointer, camera );
+    const intersects = raycaster.intersectObjects( objects, false );
+
+    if ( intersects.length > 0 ) {
+        const intersect = intersects[ 0 ];
+
+        // Kalkulasi posisi snapping grid
+        rollOverMesh.position.copy( intersect.point ).add( intersect.face.normal );
+        rollOverMesh.position.divideScalar( VOXEL_SIZE ).floor().multiplyScalar( VOXEL_SIZE ).addScalar( VOXEL_SIZE / 2 );
+    }
+}
+
+function executeBuild() {
+    // Pastikan ghost block ada di posisi valid (di atas tanah)
+    if (rollOverMesh.position.y > 0) {
+        const voxel = new THREE.Mesh( cubeGeo, getCubeMaterial() );
+        voxel.position.copy( rollOverMesh.position );
+        scene.add( voxel );
+        objects.push( voxel ); // Tambahkan ke daftar collider
+        
+        // Animasi pop kecil
+        voxel.scale.set(0.1, 0.1, 0.1);
+        let scale = 0.1;
+        const anim = setInterval(() => {
+            scale += 0.2;
+            if(scale >= 1) { scale = 1; clearInterval(anim); }
+            voxel.scale.set(scale, scale, scale);
+        }, 16);
+    }
+}
+
+function executeDelete() {
+    raycaster.setFromCamera( state.pointer, camera );
+    const intersects = raycaster.intersectObjects( objects, false );
+
+    if ( intersects.length > 0 ) {
+        const intersect = intersects[ 0 ];
+        // Jangan hapus lantai (objek index 0)
+        if ( intersect.object !== plane ) {
+            scene.remove( intersect.object );
+            objects.splice( objects.indexOf( intersect.object ), 1 );
+        }
+    }
+}
+
+
+/**
+ * 5. INISIALISASI MEDIAPIPE & LOOP RENDER
+ */
+const hands = new Hands({locateFile: (file) => {
+    return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+}});
+
+hands.setOptions({
+    maxNumHands: 2,
+    modelComplexity: 1,
+    minDetectionConfidence: 0.7,
+    minTrackingConfidence: 0.7
+});
+
+hands.onResults(onResults);
+
+const cameraObj = new Camera(videoElement, {
+    onFrame: async () => {
+        await hands.send({image: videoElement});
+    },
+    width: 640,
+    height: 480
+});
+cameraObj.start();
+
+// Inisialisasi UI
+updateColorUI();
+
+// Render Loop
+function animate() {
+    requestAnimationFrame( animate );
+
+    // Update Kamera Posisi dengan Lerp (Smoothing)
+    state.cameraAzimuth = lerp(state.cameraAzimuth, state.targetAzimuth, 0.05);
+    state.cameraPolar = lerp(state.cameraPolar, state.targetPolar, 0.05);
+    state.cameraRadius = lerp(state.cameraRadius, state.targetRadius, 0.1);
+
+    // Konversi Spherical ke Cartesian untuk posisi kamera
+    camera.position.x = state.cameraRadius * Math.sin(state.cameraPolar) * Math.cos(state.cameraAzimuth);
+    camera.position.z = state.cameraRadius * Math.sin(state.cameraPolar) * Math.sin(state.cameraAzimuth);
+    camera.position.y = state.cameraRadius * Math.cos(state.cameraPolar);
+    camera.lookAt( 0, 0, 0 );
+
+    // Update posisi Ghost Block
+    updateRaycaster();
+
+    renderer.render( scene, camera );
+}
+
+animate();
+
+</script>
+</body>
+</html>
